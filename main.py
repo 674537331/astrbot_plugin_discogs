@@ -23,7 +23,7 @@ class DiscogsAPIError(DiscogsException):
     pass
 
 
-@register("discogs_plugin", "YourName", "Discogs 音乐与黑胶查询", "1.5.3")
+@register("discogs_plugin", "RyanVaderAN", "Discogs 音乐与黑胶查询", "1.0.0")
 class DiscogsPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
