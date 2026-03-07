@@ -1,4 +1,6 @@
 import aiohttp
+import re
+import shlex
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger, AstrBotConfig
@@ -11,6 +13,9 @@ class DiscogsPlugin(Star):
         self.token = self.config.get("discogs_token", "")
         self.base_url = "https://api.discogs.com"
         
+        # 预先声明 session，用于后续复用提升性能
+        self.session = None 
+        
         # Discogs 强制要求包含 User-Agent
         self.headers = {
             "User-Agent": "AstrBotDiscogsPlugin/1.1 +https://github.com/AstrBotDevs"
@@ -18,11 +23,16 @@ class DiscogsPlugin(Star):
         if self.token:
             self.headers["Authorization"] = f"Discogs token={self.token}"
 
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """懒加载获取全局可复用的 aiohttp Session"""
+        if self.session is None or self.session.closed:
+            self.session = aiohttp.ClientSession(headers=self.headers)
+        return self.session
+
     def _parse_query(self, raw_query: str) -> dict:
         """
         高级搜索解析器。
-        将用户输入的 "nevermind year:1991 format:album" 解析为 API 接受的 params 字典。
-        支持的维度：type, title, artist, label, genre, style, country, year, format, barcode 等。
+        使用 shlex 库支持带空格和引号的值，例如: artist:"Pink Floyd" year:1973
         """
         valid_keys = [
             "type", "title", "release_title", "credit", "artist", "anv", 
@@ -30,7 +40,14 @@ class DiscogsPlugin(Star):
             "catno", "barcode", "track"
         ]
         params = {}
-        words = raw_query.split()
+        
+        try:
+            # shlex.split 会自动识别引号内的空格作为整体
+            words = shlex.split(raw_query)
+        except ValueError:
+            # 兜底：如果用户引号没闭合导致报错，退回普通按空格分割
+            words = raw_query.split()
+            
         q_words = []
         
         for word in words:
@@ -46,31 +63,37 @@ class DiscogsPlugin(Star):
             
         return params
 
-    async def _make_request(self, endpoint: str, params: dict = None) -> dict:
-        """统一的异步 HTTP 请求处理器"""
-        if not self.token and "/database/search" in endpoint:
+    async def _make_request(self, endpoint_or_url: str, params: dict = None) -> dict:
+        """统一的异步 HTTP 请求处理器，支持相对路径和绝对 URL"""
+        if not self.token and "/database/search" in endpoint_or_url:
             raise Exception("Discogs 搜索功能必须配置 Token。请前往 WebUI 插件设置页面填写。")
 
-        url = f"{self.base_url}{endpoint}"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=self.headers, params=params) as response:
-                if response.status == 200:
-                    return await response.json()
-                elif response.status == 401:
-                    raise Exception("身份验证失败，请检查 Discogs Token 是否正确。")
-                elif response.status == 404:
-                    raise Exception("未找到相关资源。")
-                elif response.status == 429:
-                    raise Exception("请求太频繁，触发了 Discogs 速率限制，请稍后重试。")
-                else:
-                    raise Exception(f"请求失败，HTTP 状态码: {response.status}")
+        # 智能判断是相对路径还是绝对路径
+        if endpoint_or_url.startswith("http"):
+            url = endpoint_or_url
+        else:
+            url = f"{self.base_url}{endpoint_or_url}"
+            
+        session = await self._get_session()
+        
+        async with session.get(url, params=params) as response:
+            if response.status == 200:
+                return await response.json()
+            elif response.status == 401:
+                raise Exception("身份验证失败，请检查 Discogs Token 是否正确。")
+            elif response.status == 404:
+                raise Exception("未找到相关资源。")
+            elif response.status == 429:
+                raise Exception("请求太频繁，触发了 Discogs 速率限制，请稍后重试。")
+            else:
+                raise Exception(f"请求失败，HTTP 状态码: {response.status}")
 
     @filter.command("音乐")
     async def search_music(self, event: AstrMessageEvent, *, query: str):
         """音乐核心库查询。支持维度过滤(如: year:1991)。用法: /音乐 <关键词>"""
         try:
             params = self._parse_query(query)
-            params["per_page"] = 1  # 我们只需要最精准的第一条记录
+            params["per_page"] = 1  # 只需要最精准的第一条记录
 
             # 1. 执行数据库搜索
             search_data = await self._make_request("/database/search", params=params)
@@ -87,9 +110,8 @@ class DiscogsPlugin(Star):
                  yield event.plain_result("找到了结果，但缺少详细信息链接。")
                  return
 
-            # 2. 获取具体资源信息 (Release 或 Master)
-            endpoint = resource_url.replace(self.base_url, "")
-            detail_data = await self._make_request(endpoint)
+            # 2. 获取具体资源信息 (Release 或 Master)，直接传入完整 URL
+            detail_data = await self._make_request(resource_url)
             
             title = detail_data.get("title", "未知标题")
             year = detail_data.get("year", "未知年份")
@@ -100,9 +122,10 @@ class DiscogsPlugin(Star):
             artist_info = "未知艺术家"
             if artists_list:
                 first_artist = artists_list[0]
-                artist_name = first_artist.get("name", "未知")
-                # 可选：如果想查艺术家详情，可以在此处再发起一次对 first_artist["resource_url"] 的请求
-                artist_info = f"{artist_name}"
+                raw_artist_name = first_artist.get("name", "未知")
+                # 清洗 Discogs 特有的同名艺术家编号，例如 "John Doe (2)" -> "John Doe"
+                clean_artist_name = re.sub(r'\s\(\d+\)$', '', raw_artist_name)
+                artist_info = clean_artist_name
 
             reply = (
                 f"🎵 检索结果：\n"
@@ -162,3 +185,9 @@ class DiscogsPlugin(Star):
         except Exception as e:
             logger.error(f"Vinyl price error: {e}")
             yield event.plain_result(f"查价失败: {str(e)}")
+
+    def terminate(self):
+        """如果框架支持在插件卸载时调用，确保关闭 session 防内存泄漏"""
+        import asyncio
+        if self.session and not self.session.closed:
+            asyncio.create_task(self.session.close())
