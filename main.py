@@ -1,52 +1,93 @@
+import asyncio
 import aiohttp
-import re
 import shlex
+import re
+from urllib.parse import urlparse
+from typing import Optional
+
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger, AstrBotConfig
 
-@register("discogs_plugin", "YourName", "Discogs 音乐与黑胶查询", "1.1.0")
+# --- 自定义异常类 ---
+class DiscogsException(Exception):
+    """Discogs 插件基础异常"""
+    pass
+
+class DiscogsAuthError(DiscogsException):
+    pass
+
+class DiscogsRateLimitError(DiscogsException):
+    pass
+
+class DiscogsAPIError(DiscogsException):
+    pass
+
+
+@register("discogs_plugin", "YourName", "Discogs 音乐与黑胶查询", "1.4.1")
 class DiscogsPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
-        self.token = self.config.get("discogs_token", "")
         self.base_url = "https://api.discogs.com"
-        
-        # 预先声明 session，用于后续复用提升性能
         self.session = None 
+        self._session_lock = asyncio.Lock()
         
-        # Discogs 强制要求包含 User-Agent
         self.headers = {
-            "User-Agent": "AstrBotDiscogsPlugin/1.1 +https://github.com/AstrBotDevs"
+            "User-Agent": "AstrBotDiscogsPlugin/1.4.1 +https://github.com/AstrBotDevs"
         }
-        if self.token:
-            self.headers["Authorization"] = f"Discogs token={self.token}"
+        self._update_auth_header()
+
+    def _update_auth_header(self):
+        token = self.config.get("discogs_token", "")
+        if token:
+            self.headers["Authorization"] = f"Discogs token={token}"
+        else:
+            self.headers.pop("Authorization", None)
+            
+    def _is_token_configured(self) -> bool:
+        """语义化：直接检查配置中是否包含有效的 token"""
+        return bool(self.config.get("discogs_token", "").strip())
 
     async def _get_session(self) -> aiohttp.ClientSession:
-        """懒加载获取全局可复用的 aiohttp Session"""
         if self.session is None or self.session.closed:
-            self.session = aiohttp.ClientSession(headers=self.headers)
+            async with self._session_lock:
+                if self.session is None or self.session.closed:
+                    timeout = aiohttp.ClientTimeout(total=15, connect=5, sock_read=10)
+                    self.session = aiohttp.ClientSession(timeout=timeout)
         return self.session
 
+    def _normalize_discogs_url(self, endpoint_or_url: str) -> str:
+        if endpoint_or_url.startswith(("http://", "https://")):
+            parsed = urlparse(endpoint_or_url)
+            if parsed.scheme != "https" or parsed.netloc != "api.discogs.com":
+                raise DiscogsAPIError("非法的 Discogs 资源地址，拒绝请求。")
+            return endpoint_or_url
+            
+        path = endpoint_or_url if endpoint_or_url.startswith("/") else f"/{endpoint_or_url}"
+        return f"{self.base_url}{path}"
+        
+    def _normalize_web_url(self, uri: str, fallback: str = "暂无链接") -> str:
+        if not uri:
+            return fallback
+        if uri.startswith("/"):
+            return f"https://www.discogs.com{uri}"
+        if uri.startswith(("http://", "https://")):
+            return uri
+        return fallback
+
     def _parse_query(self, raw_query: str) -> dict:
-        """
-        高级搜索解析器。
-        使用 shlex 库支持带空格和引号的值，例如: artist:"Pink Floyd" year:1973
-        """
-        valid_keys = [
+        valid_keys = {
             "type", "title", "release_title", "credit", "artist", "anv", 
             "label", "genre", "style", "country", "year", "format", 
             "catno", "barcode", "track"
-        ]
+        }
         params = {}
         
         try:
-            # shlex.split 会自动识别引号内的空格作为整体
             words = shlex.split(raw_query)
         except ValueError:
-            # 兜底：如果用户引号没闭合导致报错，退回普通按空格分割
-            words = raw_query.split()
+            raise DiscogsException('查询语法有误：引号可能未正确闭合。示例：artist:"Pink Floyd" year:1973')
             
         q_words = []
         
@@ -54,8 +95,11 @@ class DiscogsPlugin(Star):
             if ":" in word:
                 parts = word.split(":", 1)
                 if len(parts) == 2 and parts[0] in valid_keys:
-                    params[parts[0]] = parts[1]
-                    continue
+                    key = parts[0]
+                    value = parts[1].strip()
+                    if value:
+                        params[key] = value
+                        continue
             q_words.append(word)
             
         if q_words:
@@ -64,38 +108,71 @@ class DiscogsPlugin(Star):
         return params
 
     async def _make_request(self, endpoint_or_url: str, params: dict = None) -> dict:
-        """统一的异步 HTTP 请求处理器，支持相对路径和绝对 URL"""
-        if not self.token and "/database/search" in endpoint_or_url:
-            raise Exception("Discogs 搜索功能必须配置 Token。请前往 WebUI 插件设置页面填写。")
-
-        # 智能判断是相对路径还是绝对路径
-        if endpoint_or_url.startswith("http"):
-            url = endpoint_or_url
-        else:
-            url = f"{self.base_url}{endpoint_or_url}"
-            
-        session = await self._get_session()
+        self._update_auth_header()
         
-        async with session.get(url, params=params) as response:
-            if response.status == 200:
-                return await response.json()
-            elif response.status == 401:
-                raise Exception("身份验证失败，请检查 Discogs Token 是否正确。")
-            elif response.status == 404:
-                raise Exception("未找到相关资源。")
-            elif response.status == 429:
-                raise Exception("请求太频繁，触发了 Discogs 速率限制，请稍后重试。")
-            else:
-                raise Exception(f"请求失败，HTTP 状态码: {response.status}")
+        url = self._normalize_discogs_url(endpoint_or_url)
+        session = await self._get_session()
+        request_headers = dict(self.headers)
+        
+        try:
+            async with session.get(url, params=params, headers=request_headers) as response:
+                if response.status == 200:
+                    try:
+                        return await response.json()
+                    except (aiohttp.ContentTypeError, ValueError):
+                        raise DiscogsAPIError("Discogs 返回了非 JSON 格式的数据。")
+                
+                text = await response.text()
+                clean_text = " ".join(text.split())[:100]
+                
+                if response.status == 400:
+                    raise DiscogsAPIError(f"请求参数错误，请检查搜索维度。详情: {clean_text}")
+                elif response.status == 401:
+                    raise DiscogsAuthError("身份验证失败，请检查 WebUI 中的 Discogs Token 是否正确。")
+                elif response.status == 403:
+                    raise DiscogsAPIError("请求被 Discogs 拒绝，可能是权限不足。")
+                elif response.status == 404:
+                    raise DiscogsAPIError("未找到相关资源。")
+                elif response.status == 429:
+                    retry_after = response.headers.get("Retry-After")
+                    msg = "请求过于频繁，触发 Discogs 速率限制"
+                    msg += f"，建议等待 {retry_after} 秒后再试。" if retry_after else "，请稍后重试。"
+                    raise DiscogsRateLimitError(msg)
+                elif 500 <= response.status < 600:
+                    raise DiscogsAPIError("Discogs 服务暂时不可用，请稍后重试。")
+                else:
+                    raise DiscogsAPIError(f"HTTP {response.status}: {clean_text}")
+
+        except asyncio.TimeoutError:
+            raise DiscogsException("请求 Discogs 超时，请检查网络或稍后重试。")
+        except aiohttp.ClientConnectionError:
+            raise DiscogsException("无法连接到 Discogs 服务器，请检查网络连通性。")
+        except aiohttp.ClientError as e:
+            raise DiscogsException(f"网络请求引发内部异常: {str(e)}")
+
+    def _validate_input(self, query: str) -> Optional[str]:
+        if not query or not query.strip():
+            return "请输入查询关键词，例如：/音乐 nevermind year:1991"
+        if len(query) > 200:
+            return "查询内容过长，请精简到 200 字符以内后重试。"
+        return None
 
     @filter.command("音乐")
-    async def search_music(self, event: AstrMessageEvent, *, query: str):
-        """音乐核心库查询。支持维度过滤(如: year:1991)。用法: /音乐 <关键词>"""
+    async def search_music(self, event: AstrMessageEvent, *, query: str = ""):
+        self._update_auth_header()
+        if not self._is_token_configured():
+            yield event.plain_result("请先在 WebUI 插件配置中填写 Discogs Token 才可使用搜索功能。")
+            return
+
+        error_msg = self._validate_input(query)
+        if error_msg:
+            yield event.plain_result(error_msg)
+            return
+
         try:
             params = self._parse_query(query)
-            params["per_page"] = 1  # 只需要最精准的第一条记录
+            params["per_page"] = 3  
 
-            # 1. 执行数据库搜索
             search_data = await self._make_request("/database/search", params=params)
             results = search_data.get("results", [])
             
@@ -103,53 +180,86 @@ class DiscogsPlugin(Star):
                 yield event.plain_result(f"未找到与 '{query}' 相关的音乐记录。")
                 return
 
-            best_match = results[0]
-            resource_url = best_match.get("resource_url")
+            reply_parts = [f"🎵 关于 '{query}' 的搜索结果：\n"]
+            other_candidates = []
             
-            if not resource_url:
-                 yield event.plain_result("找到了结果，但缺少详细信息链接。")
-                 return
+            for i, res in enumerate(results[:3], 1):
+                if i == 1:
+                    # 尝试拉取最佳匹配的详细信息
+                    detail_fetched = False
+                    if res.get("resource_url"):
+                        try:
+                            detail_data = await self._make_request(res.get("resource_url"))
+                            title = detail_data.get("title", "未知标题")
+                            year = detail_data.get("year", "未知年份")
+                            genres = ", ".join(detail_data.get("genres", []))
+                            
+                            artists_list = detail_data.get("artists", [])
+                            artist_names = [re.sub(r'\s\(\d+\)$', '', a.get("name", "未知")) for a in artists_list[:3]]
+                            artist_info = ", ".join(artist_names) if artist_names else "未知艺术家"
+                            
+                            full_url = self._normalize_web_url(detail_data.get('uri'))
+                            
+                            reply_parts.append(
+                                f"🥇 【最佳匹配】\n"
+                                f"   《{title}》 ({year})\n"
+                                f"   👤 艺术家: {artist_info}\n"
+                                f"   🎸 流派: {genres}\n"
+                                f"   🔗 {full_url}\n"
+                            )
+                            detail_fetched = True
+                        except DiscogsException as sub_e:
+                            logger.warning(f"Discogs API error fetching detail for top match: {sub_e}")
+                        except Exception:
+                            logger.exception("Unexpected error fetching detail for top match")
+                    
+                    # 如果缺少 resource_url 或拉取失败，触发优雅降级
+                    if not detail_fetched:
+                        title = res.get("title", "未知标题/艺术家")
+                        year = res.get("year", "未知")
+                        full_url = self._normalize_web_url(res.get("uri"))
+                        reply_parts.append(
+                            f"🥇 【最佳匹配】(基础信息)\n"
+                            f"   《{title}》 ({year})\n"
+                            f"   🔗 {full_url}\n"
+                        )
+                    continue
 
-            # 2. 获取具体资源信息 (Release 或 Master)，直接传入完整 URL
-            detail_data = await self._make_request(resource_url)
-            
-            title = detail_data.get("title", "未知标题")
-            year = detail_data.get("year", "未知年份")
-            genres = ", ".join(detail_data.get("genres", []))
-            
-            # 提取艺术家信息并截取简介防止刷屏
-            artists_list = detail_data.get("artists", [])
-            artist_info = "未知艺术家"
-            if artists_list:
-                first_artist = artists_list[0]
-                raw_artist_name = first_artist.get("name", "未知")
-                # 清洗 Discogs 特有的同名艺术家编号，例如 "John Doe (2)" -> "John Doe"
-                clean_artist_name = re.sub(r'\s\(\d+\)$', '', raw_artist_name)
-                artist_info = clean_artist_name
+                # 备选结果
+                title = res.get("title", "未知标题/艺术家")
+                year = res.get("year", "未知")
+                full_url = self._normalize_web_url(res.get("uri"))
 
-            reply = (
-                f"🎵 检索结果：\n"
-                f"标题: 《{title}》 ({year})\n"
-                f"艺术家: {artist_info}\n"
-                f"流派: {genres}\n"
-                f"🔗 链接: {detail_data.get('uri', '暂无')}"
-            )
-            yield event.plain_result(reply)
+                other_candidates.append(f"   {len(other_candidates) + 1}. 《{title}》 ({year}) - {full_url}")
 
-        except Exception as e:
-            logger.error(f"Music search error: {e}")
+            if other_candidates:
+                reply_parts.append("📚 【其他候选】\n" + "\n".join(other_candidates))
+
+            yield event.plain_result("\n".join(reply_parts))
+
+        except DiscogsException as e:
             yield event.plain_result(f"查询失败: {str(e)}")
-
+        except Exception:
+            logger.exception("Discogs music search encountered an unexpected error")
+            yield event.plain_result("发生未知内部错误，请稍后重试。")
 
     @filter.command("黑胶价格")
-    async def check_vinyl_price(self, event: AstrMessageEvent, *, query: str):
-        """查询黑胶唱片市价。支持维度过滤(如: genre:rock)。用法: /黑胶价格 <关键词>"""
+    async def check_vinyl_price(self, event: AstrMessageEvent, *, query: str = ""):
+        self._update_auth_header()
+        if not self._is_token_configured():
+            yield event.plain_result("请先在 WebUI 插件配置中填写 Discogs Token 才可使用查价功能。")
+            return
+
+        error_msg = self._validate_input(query)
+        if error_msg:
+            yield event.plain_result(error_msg)
+            return
+
         try:
             params = self._parse_query(query)
-            # 强制限定搜索格式为黑胶，并且只找 Release (Master 级别没有具体价格)
             params["format"] = "vinyl"
             params["type"] = "release"
-            params["per_page"] = 1
+            params["per_page"] = 3
 
             search_data = await self._make_request("/database/search", params=params)
             results = search_data.get("results", [])
@@ -158,36 +268,51 @@ class DiscogsPlugin(Star):
                 yield event.plain_result(f"未找到与 '{query}' 相关的黑胶唱片记录。")
                 return
                 
-            best_match = results[0]
-            release_id = best_match.get("id")
-            title = best_match.get("title", "未知标题")
-            
-            # 通过 Release 接口获取市场报价数据，指定获取美元报价
-            release_data = await self._make_request(f"/releases/{release_id}", params={"curr_abbr": "USD"})
-            
-            lowest_price = release_data.get("lowest_price")
-            num_for_sale = release_data.get("num_for_sale", 0)
-            year = release_data.get("year", "未知年份")
-            
-            if num_for_sale > 0 and lowest_price is not None:
-                market_info = f"💰 当前有 {num_for_sale} 张在售，最低起售价约: ${lowest_price:.2f} (USD)"
-            else:
-                market_info = "🪹 目前 Discogs 市场上暂无卖家出售此黑胶。"
+            reply_parts = [f"💿 关于 '{query}' 的黑胶市价 (前 {len(results[:3])} 个匹配)：\n"]
 
-            reply = (
-                f"💿 匹配黑胶：《{title}》({year})\n"
-                f"{market_info}\n"
-                f"🔗 详情与购买: https://www.discogs.com/release/{release_id}"
-            )
-            
-            yield event.plain_result(reply)
+            for i, res in enumerate(results[:3], 1):
+                release_id = res.get("id")
+                search_title = res.get("title", "未知标题")
+                search_year = res.get("year", "未知年份")
+                
+                if not release_id:
+                    reply_parts.append(f"{i}. 《{search_title}》\n   ❌ 缺少发行版 ID，无法查询价格")
+                    continue
+                
+                try:
+                    release_data = await self._make_request(f"/releases/{release_id}", params={"curr_abbr": "USD"})
+                    
+                    lowest_price = release_data.get("lowest_price")
+                    num_for_sale = release_data.get("num_for_sale", 0)
+                    
+                    if num_for_sale > 0 and lowest_price is not None:
+                        try:
+                            price_text = f"${float(lowest_price):.2f} (USD)"
+                        except (TypeError, ValueError):
+                            price_text = "价格数据解析异常"
+                            
+                        market_info = f"💰 {num_for_sale} 张在售 | 最低起售价约: {price_text}"
+                    else:
+                        market_info = "🪹 目前市场上暂无卖家出售"
 
-        except Exception as e:
-            logger.error(f"Vinyl price error: {e}")
+                    detail_url = self._normalize_web_url(release_data.get("uri"), f"https://www.discogs.com/release/{release_id}")
+                    reply_parts.append(f"{i}. 《{search_title}》 ({search_year})\n   {market_info}\n   🔗 详情: {detail_url}")
+                    
+                except DiscogsException as sub_e:
+                    reply_parts.append(f"{i}. 《{search_title}》\n   ❌ 获取市场价格失败: {str(sub_e)}")
+                except Exception:
+                    logger.exception("Unexpected error fetching price for release %s", release_id)
+                    reply_parts.append(f"{i}. 《{search_title}》\n   ❌ 查价发生内部错误")
+
+            yield event.plain_result("\n\n".join(reply_parts))
+
+        except DiscogsException as e:
             yield event.plain_result(f"查价失败: {str(e)}")
+        except Exception:
+            logger.exception("Discogs vinyl price check encountered an unexpected error")
+            yield event.plain_result("发生未知内部错误，请稍后重试。")
 
-    def terminate(self):
-        """如果框架支持在插件卸载时调用，确保关闭 session 防内存泄漏"""
-        import asyncio
+    async def terminate(self):
         if self.session and not self.session.closed:
-            asyncio.create_task(self.session.close())
+            await self.session.close()
+        self.session = None
