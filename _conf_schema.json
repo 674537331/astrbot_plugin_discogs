@@ -1,1 +1,9 @@
-
+{
+  "discogs_token": {
+    "description": "Discogs 个人访问令牌 (Personal Access Token)",
+    "type": "string",
+    "hint": "必填。在 Discogs 网页端的 Settings -> Developers 中生成。如果不填将无法使用任何搜索功能。",
+    "obvious_hint": true,
+    "default": ""
+  }
+}
