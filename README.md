@@ -2,6 +2,12 @@
 
 基于 Discogs 庞大数据库的 AstrBot 插件，支持快速检索全球音乐发行信息，并实时查询黑胶唱片的二手市场底价。
 
+<div align="center">
+
+[![Moe Counter](https://count.getloli.com/get/@astrabot_plugin_discogs?theme=moebooru)](https://github.com/你的用户名/astrabot_plugin_discogs)
+
+</div>
+
 ## ✨ 核心功能
 
 * **音乐元数据检索**：快速获取专辑的发行年份、流派、艺术家信息及 Discogs 详情链接。
