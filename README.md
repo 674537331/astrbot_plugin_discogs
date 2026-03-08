@@ -4,7 +4,7 @@
 
 <div align="center">
 
-[![Moe Counter](https://count.getloli.com/get/@astrabot_plugin_discogs?theme=moebooru)](https://github.com/你的用户名/astrabot_plugin_discogs)
+[![Moe Counter](https://count.getloli.com/get/@astrabot_plugin_discogs?theme=moebooru)](https://github.com/674537331/astrabot_plugin_discogs)
 
 </div>
 
