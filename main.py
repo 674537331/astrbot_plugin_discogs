@@ -378,7 +378,3 @@ class DiscogsPlugin(Star):
 
         if session and not session.closed:
             await session.close()
-    async def terminate(self):
-        if self.session and not self.session.closed:
-            await self.session.close()
-        self.session = None
