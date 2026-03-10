@@ -23,7 +23,7 @@ class DiscogsAPIError(DiscogsException):
     pass
 
 
-@register("discogs_plugin", "RyanVaderAN", "Discogs 音乐与黑胶查询", "1.0.0")
+@register("discogs_plugin", "RyanVaderAN", "Discogs 音乐与黑胶查询", "1.0.2")
 class DiscogsPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -39,11 +39,15 @@ class DiscogsPlugin(Star):
             "Accept": "application/vnd.discogs.v2.discogs+json"
         }
 
+    # 🚀 优化：抽取 token 获取逻辑，符合 DRY 原则
+    def _get_token(self) -> str:
+        return str(self.config.get("discogs_token") or "").strip()
+
     def _is_token_configured(self) -> bool:
-        return bool(self.config.get("discogs_token", "").strip())
+        return bool(self._get_token())
 
     def _get_auth_header(self) -> Dict[str, str]:
-        token = self.config.get("discogs_token", "").strip()
+        token = self._get_token()
         if token:
             return {"Authorization": f"Discogs token={token}"}
         return {}
@@ -59,7 +63,10 @@ class DiscogsPlugin(Star):
     def _normalize_discogs_url(self, endpoint_or_url: str) -> str:
         if endpoint_or_url.startswith(("http://", "https://")):
             parsed = urlparse(endpoint_or_url)
-            if parsed.scheme != "https" or parsed.netloc != "api.discogs.com":
+            # 🚀 优化：显式强制小写，并增加 443 端口严格白名单限制
+            hostname = (parsed.hostname or "").lower()
+            port = parsed.port
+            if parsed.scheme != "https" or hostname != "api.discogs.com" or (port not in (None, 443)):
                 raise DiscogsAPIError("非法的 Discogs 资源地址，拒绝请求。")
             return endpoint_or_url
             
@@ -75,7 +82,9 @@ class DiscogsPlugin(Star):
         
         if uri.startswith(("http://", "https://")):
             parsed = urlparse(uri)
-            if parsed.scheme == "https" and parsed.netloc.lower() in self._allowed_web_domains:
+            # 🚀 优化：主机名显式转小写
+            hostname = (parsed.hostname or "").lower()
+            if parsed.scheme == "https" and hostname in self._allowed_web_domains:
                 return uri
             else:
                 logger.warning(f"Blocked suspicious Discogs web URI: {str(uri)[:50]}...")
@@ -125,7 +134,6 @@ class DiscogsPlugin(Star):
             return "查询内容过长，请精简到 200 字符以内。"
         return None
 
-    # 类型标注优化
     async def _make_request(self, endpoint_or_url: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         url = self._normalize_discogs_url(endpoint_or_url)
         session = await self._get_session()
@@ -138,7 +146,6 @@ class DiscogsPlugin(Star):
                 used = response.headers.get("X-Discogs-Ratelimit-Used")
                 remaining = response.headers.get("X-Discogs-Ratelimit-Remaining")
                 
-                # 常规 Debug 日志，便于观测窗口
                 if limit and remaining:
                     logger.debug(f"Discogs API Rate Limit: {used}/{limit} used. {remaining} remaining.")
                 
@@ -148,7 +155,8 @@ class DiscogsPlugin(Star):
                     except (aiohttp.ContentTypeError, ValueError):
                         raise DiscogsAPIError("Discogs 返回了非 JSON 格式的数据。")
                 
-                text = await response.text()
+                chunk = await response.content.read(1024)
+                text = chunk.decode('utf-8', errors='replace')
                 clean_text = " ".join(text.split())[:100]
                 
                 if response.status == 400:
@@ -175,7 +183,9 @@ class DiscogsPlugin(Star):
         except aiohttp.ClientConnectionError:
             raise DiscogsException("无法连接到 Discogs 服务器。")
         except aiohttp.ClientError as e:
-            raise DiscogsException(f"网络请求引发内部异常: {str(e)[:50]}...")
+            # 🚀 优化：完全收敛底层异常，日志自留，提示更清爽
+            logger.warning(f"Discogs client error: {type(e).__name__} - {e}")
+            raise DiscogsException("网络请求失败，请稍后重试。")
 
     def _format_best_match_message(self, data: Dict[str, Any], is_detailed: bool, note: str = "") -> str:
         raw_title = data.get("title", "未知标题")
@@ -185,13 +195,11 @@ class DiscogsPlugin(Star):
         album_title = raw_title
         artist_info = "未知"
         
-        # UX 优化：根据不同模式提取或拆分艺术家信息
         if is_detailed:
             artists_list = data.get("artists", [])
             artist_names = [re.sub(r'\s\(\d+\)$', '', a.get("name", "未知")) for a in artists_list[:3]]
             artist_info = ", ".join(artist_names) if artist_names else "未知"
         else:
-            # 搜索接口返回的内容通常为 "Artist - Title"
             if " - " in raw_title:
                 parts = raw_title.split(" - ", 1)
                 artist_info = parts[0].strip()
@@ -349,7 +357,6 @@ class DiscogsPlugin(Star):
             
             for res in price_results:
                 if isinstance(res, Exception):
-                    # 修复 1：使用 logger.error 打印并发任务抛出的实际异常文本
                     logger.error(f"A price fetching task failed abruptly: {repr(res)}")
                     reply_parts.append("   ❌ 某条价格查询任务异常中止，请稍后重试。")
                 else:
@@ -363,6 +370,14 @@ class DiscogsPlugin(Star):
             logger.exception("Discogs vinyl price check encountered an unexpected error")
             yield event.plain_result("发生未知内部错误，请稍后重试。")
 
+    async def terminate(self):
+        # 🚀 优化：缩小锁的范围，仅保护引用交接，避免 I/O 阻塞事件循环
+        async with self._session_lock:
+            session = self.session
+            self.session = None
+
+        if session and not session.closed:
+            await session.close()
     async def terminate(self):
         if self.session and not self.session.closed:
             await self.session.close()
