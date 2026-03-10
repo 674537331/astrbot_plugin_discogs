@@ -2,7 +2,7 @@ name: astrbot_plugin_discogs
 display_name: Discogs音乐库
 author: RyanVaderAn
 repo: https://github.com/674537331/astrbot_plugin_discogs
-version: 1.1.0
+version: 1.0.2
 description: 支持多维度检索的 Discogs 音乐与黑胶市价查询工具。
 astrbot_version: ">=3.4.0"
 support_platforms:
